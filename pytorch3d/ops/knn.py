@@ -6,16 +6,132 @@
 
 # pyre-unsafe
 
+import heapq
 from collections import namedtuple
 from typing import Union
 
 import torch
-from pytorch3d import _C
 from torch.autograd import Function
 from torch.autograd.function import once_differentiable
 
 
 _KNN = namedtuple("KNN", "dists idx knn")
+
+
+def _knn_points_idx_forward(
+    p1: torch.Tensor,
+    p2: torch.Tensor,
+    lengths1: torch.Tensor,
+    lengths2: torch.Tensor,
+    norm: int,
+    K: int,
+) -> tuple:
+    """
+    Pure PyTorch implementation of KNN forward.
+    Finds K nearest neighbors in p2 for each point in p1.
+    """
+    N, P1, D = p1.shape
+    P2 = p2.shape[1]
+
+    idx = torch.zeros((N, P1, K), dtype=torch.int64, device=p1.device)
+    dists = torch.zeros((N, P1, K), dtype=p1.dtype, device=p1.device)
+
+    for n in range(N):
+        len1 = lengths1[n].item()
+        len2 = lengths2[n].item()
+        for i in range(len1):
+            # Compute distances to all points in p2[n]
+            diff = p1[n, i : i + 1] - p2[n, :len2]  # (len2, D)
+            if norm == 1:
+                dist = diff.abs().sum(dim=1)  # (len2,)
+            else:  # norm == 2
+                dist = (diff * diff).sum(dim=1)  # (len2,)
+            # Get K smallest using heap
+            if len2 <= K:
+                k_actual = len2
+                sort_idx = torch.argsort(dist)
+                idx[n, i, :k_actual] = sort_idx
+                dists[n, i, :k_actual] = dist[sort_idx]
+            else:
+                # Use heap to get K smallest
+                heap = [(dist[j].item(), j) for j in range(len2)]
+                heapq.heapify(heap)
+                k_smallest = heapq.nsmallest(K, heap)
+                for k, (d, j) in enumerate(k_smallest):
+                    idx[n, i, k] = j
+                    dists[n, i, k] = d
+    return idx, dists
+
+
+def _knn_points_backward_python(
+    p1: torch.Tensor,
+    p2: torch.Tensor,
+    idx: torch.Tensor,
+    grad_dists: torch.Tensor,
+    norm: int,
+    lengths1: torch.Tensor,
+    lengths2: torch.Tensor,
+) -> tuple:
+    """
+    Pure PyTorch implementation of KNN backward.
+    Supports norm=1 (L1) and norm=2 (L2 squared).
+    """
+    N, P1, K = idx.shape
+    D = p1.shape[2]
+    P2 = p2.shape[1]
+
+    # Valid mask: (n,i,k) valid if k < min(lengths2[n], K) and idx[n,i,k] >= 0
+    # Matches C++ which iterates k in range(min(length2, K)); idx>=0 handles ball_query padding
+    k_valid = torch.arange(K, device=idx.device).unsqueeze(0)
+    len2_clamped = torch.minimum(lengths2, torch.tensor(K, device=idx.device))
+    valid_k = k_valid < len2_clamped.unsqueeze(1)
+    valid_k = valid_k.unsqueeze(1).expand(-1, P1, -1)
+    valid_i = (
+        torch.arange(P1, device=idx.device).unsqueeze(0).unsqueeze(2)
+        < lengths1.unsqueeze(1).unsqueeze(2)
+    )
+    mask = (
+        (valid_k & valid_i & (idx >= 0))
+        .unsqueeze(-1)
+        .expand(-1, -1, -1, D)
+    )
+
+    idx_clamped = idx.clamp(min=0)
+    p2_expanded = p2[:, :, None, :].expand(-1, -1, K, -1)
+    idx_expanded = idx_clamped.unsqueeze(-1).expand(-1, -1, -1, D)
+    p2_nn = p2_expanded.gather(1, idx_expanded)
+    p2_nn = torch.where(mask, p2_nn, torch.zeros_like(p2_nn))
+
+    diff = p1.unsqueeze(2) - p2_nn  # (N, P1, K, D)
+    if norm == 1:
+        # L1: d(|x|)/dx = sign(x), use 1 for x>0, -1 for x<=0
+        sign = torch.where(diff > 0, torch.ones_like(diff), -torch.ones_like(diff))
+        grad_diff = grad_dists.unsqueeze(-1) * sign
+    else:  # norm == 2
+        grad_diff = grad_dists.unsqueeze(-1) * 2.0 * diff
+    grad_diff = torch.where(mask, grad_diff, torch.zeros_like(grad_diff))
+
+    grad_p1 = grad_diff.sum(dim=2)
+
+    grad_p2 = torch.zeros_like(p2)
+    grad_diff_neg = -grad_diff
+    grad_diff_neg = torch.where(mask, grad_diff_neg, torch.zeros_like(grad_diff_neg))
+    # scatter_add: for each (n,i,k), add grad_diff_neg[n,i,k] to grad_p2[n, idx[n,i,k]]
+    # Flatten (P1, K) for scatter: index (N, P1*K, D), src (N, P1*K, D)
+    idx_flat = idx.reshape(N, -1, 1).expand(-1, -1, D)
+    grad_flat = grad_diff_neg.reshape(N, -1, D)
+    idx_flat = torch.where(
+        (idx >= 0).reshape(N, -1, 1).expand(-1, -1, D),
+        idx_flat,
+        torch.zeros_like(idx_flat),
+    )
+    grad_flat = torch.where(
+        (idx >= 0).reshape(N, -1, 1).expand(-1, -1, D),
+        grad_flat,
+        torch.zeros_like(grad_flat),
+    )
+    grad_p2.scatter_add_(1, idx_flat, grad_flat)
+    return grad_p1, grad_p2
 
 
 class _knn_points(Function):
@@ -71,7 +187,9 @@ class _knn_points(Function):
         if not ((norm == 1) or (norm == 2)):
             raise ValueError("Support for 1 or 2 norm.")
 
-        idx, dists = _C.knn_points_idx(p1, p2, lengths1, lengths2, norm, K, version)
+        idx, dists = _knn_points_idx_forward(
+            p1, p2, lengths1, lengths2, norm, K
+        )
 
         # sort KNN in ascending order if K > 1
         if K > 1 and return_sorted:
@@ -105,8 +223,8 @@ class _knn_points(Function):
             p1 = p1.float()
         if not (p2.dtype == torch.float32):
             p2 = p2.float()
-        grad_p1, grad_p2 = _C.knn_points_backward(
-            p1, p2, lengths1, lengths2, idx, norm, grad_dists
+        grad_p1, grad_p2 = _knn_points_backward_python(
+            p1, p2, idx, grad_dists, norm, lengths1, lengths2
         )
         return grad_p1, grad_p2, None, None, None, None, None, None
 

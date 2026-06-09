@@ -7,9 +7,73 @@
 # pyre-unsafe
 
 import torch
-from pytorch3d import _C
 from torch.autograd import Function
 from torch.autograd.function import once_differentiable
+
+
+def _interp_face_attrs_forward(
+    pix_to_face: torch.Tensor,
+    barycentric_coords: torch.Tensor,
+    face_attrs: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Pure PyTorch implementation of face attribute interpolation forward.
+    pix_attrs[p, d] = sum_i barycentric_coords[p, i] * face_attrs[f, i, d]
+    where f = pix_to_face[p]. Pixels with pix_to_face < 0 output 0.
+    """
+    P = pix_to_face.shape[0]
+    _, _, D = face_attrs.shape
+    mask = pix_to_face >= 0
+    pix_to_face_clamped = pix_to_face.clamp(min=0)
+    # Gather face attributes: (P, 3, D)
+    idx = pix_to_face_clamped.view(P, 1, 1).expand(P, 3, D)
+    face_attrs_at_pixels = face_attrs.gather(0, idx)
+    # Interpolate: sum over vertex dim
+    pix_attrs = (barycentric_coords.unsqueeze(-1) * face_attrs_at_pixels).sum(
+        dim=1
+    )
+    pix_attrs = torch.where(mask.unsqueeze(-1), pix_attrs, torch.zeros_like(pix_attrs))
+    return pix_attrs
+
+
+def _interp_face_attrs_backward(
+    pix_to_face: torch.Tensor,
+    barycentric_coords: torch.Tensor,
+    face_attrs: torch.Tensor,
+    grad_pix_attrs: torch.Tensor,
+) -> tuple:
+    """
+    Pure PyTorch implementation of face attribute interpolation backward.
+    """
+    P = pix_to_face.shape[0]
+    _, _, D = face_attrs.shape
+    mask = pix_to_face >= 0
+    pix_to_face_clamped = pix_to_face.clamp(min=0)
+    idx = pix_to_face_clamped.view(P, 1, 1).expand(P, 3, D)
+    face_attrs_at_pixels = face_attrs.gather(0, idx)
+
+    # grad_barycentric_coords[p, i] = sum_d face_attrs[f,i,d] * grad_pix_attrs[p,d]
+    grad_barycentric_coords = (
+        face_attrs_at_pixels * grad_pix_attrs.unsqueeze(1)
+    ).sum(dim=-1)
+    grad_barycentric_coords = torch.where(
+        mask.unsqueeze(-1), grad_barycentric_coords, torch.zeros_like(grad_barycentric_coords)
+    )
+
+    # grad_face_attrs[f, i, d] += bary[p,i] * grad_pix[p,d] for each p with pix_to_face[p]=f
+    grad_face_attrs = torch.zeros_like(face_attrs)
+    src = (
+        barycentric_coords.unsqueeze(-1) * grad_pix_attrs.unsqueeze(1)
+    )  # (P, 3, D)
+    idx_expanded = pix_to_face_clamped.view(P, 1, 1).expand(P, 3, D)
+    src = torch.where(
+        mask.unsqueeze(-1).unsqueeze(-1), src, torch.zeros_like(src)
+    )
+    idx_expanded = torch.where(
+        mask.unsqueeze(-1).unsqueeze(-1), idx_expanded, torch.zeros_like(idx_expanded)
+    )
+    grad_face_attrs.scatter_add_(0, idx_expanded, src)
+    return grad_barycentric_coords, grad_face_attrs
 
 
 def interpolate_face_attributes(
@@ -47,13 +111,7 @@ def interpolate_face_attributes(
         msg = "pix_to_face must have shape (batch_size, H, W, K); got %r"
         raise ValueError(msg % (pix_to_face.shape,))
 
-    # On CPU use the python version
-    # TODO: Implement a C++ version of this function
-    if not pix_to_face.is_cuda:
-        args = (pix_to_face, barycentric_coords, face_attributes)
-        return interpolate_face_attributes_python(*args)
-
-    # Otherwise flatten and call the custom autograd function
+    # Flatten and call the custom autograd function (pure PyTorch implementation)
     N, H, W, K = pix_to_face.shape
     pix_to_face = pix_to_face.view(-1)
     barycentric_coords = barycentric_coords.view(N * H * W * K, 3)
@@ -66,20 +124,19 @@ def interpolate_face_attributes(
 class _InterpFaceAttrs(Function):
     @staticmethod
     def forward(ctx, pix_to_face, barycentric_coords, face_attrs):
-        args = (pix_to_face, barycentric_coords, face_attrs)
-        ctx.save_for_backward(*args)
-        return _C.interp_face_attrs_forward(*args)
+        ctx.save_for_backward(pix_to_face, barycentric_coords, face_attrs)
+        return _interp_face_attrs_forward(
+            pix_to_face, barycentric_coords, face_attrs
+        )
 
     @staticmethod
     @once_differentiable
     def backward(ctx, grad_pix_attrs):
-        args = ctx.saved_tensors
-        args = args + (grad_pix_attrs,)
-        grads = _C.interp_face_attrs_backward(*args)
-        grad_pix_to_face = None
-        grad_barycentric_coords = grads[0]
-        grad_face_attrs = grads[1]
-        return grad_pix_to_face, grad_barycentric_coords, grad_face_attrs
+        pix_to_face, barycentric_coords, face_attrs = ctx.saved_tensors
+        grad_barycentric_coords, grad_face_attrs = _interp_face_attrs_backward(
+            pix_to_face, barycentric_coords, face_attrs, grad_pix_attrs
+        )
+        return None, grad_barycentric_coords, grad_face_attrs
 
 
 def interpolate_face_attributes_python(

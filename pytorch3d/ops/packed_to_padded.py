@@ -7,14 +7,64 @@
 # pyre-unsafe
 
 import torch
-from pytorch3d import _C
 from torch.autograd import Function
-from torch.autograd.function import once_differentiable
+
+
+def _packed_to_padded_forward(
+    inputs: torch.Tensor, first_idxs: torch.Tensor, max_size: int
+) -> torch.Tensor:
+    """
+    Pure PyTorch packed_to_padded.
+    inputs: (F, D), first_idxs: (N,) -> output: (N, max_size, D)
+    """
+    N = first_idxs.shape[0]
+    F, D = inputs.shape
+    device = inputs.device
+    inputs_padded = torch.zeros(N, max_size, D, dtype=inputs.dtype, device=device)
+    first_idxs = first_idxs.contiguous()
+    # end_idxs[i] = start of next batch, or F for last batch
+    end_idxs = torch.cat(
+        [first_idxs[1:], torch.tensor([F], dtype=torch.int64, device=device)]
+    )
+    for i in range(N):
+        start = first_idxs[i].item()
+        end = end_idxs[i].item()
+        num = end - start
+        if num > 0:
+            inputs_padded[i, :num, :] = inputs[start:end, :]
+    return inputs_padded
+
+
+def _padded_to_packed_forward(
+    inputs: torch.Tensor, first_idxs: torch.Tensor, num_inputs: int
+) -> torch.Tensor:
+    """
+    Pure PyTorch padded_to_packed.
+    inputs: (N, max_size, D), first_idxs: (N,) -> output: (F, D)
+    """
+    N, max_size, D = inputs.shape
+    device = inputs.device
+    inputs_packed = torch.zeros(num_inputs, D, dtype=inputs.dtype, device=device)
+    first_idxs = first_idxs.contiguous()
+    end_idxs = torch.cat(
+        [
+            first_idxs[1:],
+            torch.tensor([num_inputs], dtype=torch.int64, device=device),
+        ]
+    )
+    for i in range(N):
+        start = first_idxs[i].item()
+        end = end_idxs[i].item()
+        num = end - start
+        if num > 0:
+            inputs_packed[start:end, :] = inputs[i, :num, :]
+    return inputs_packed
 
 
 class _PackedToPadded(Function):
     """
-    Torch autograd Function wrapper for packed_to_padded C++/CUDA implementations.
+    Torch autograd Function wrapper for packed_to_padded.
+    Uses pure PyTorch implementation (no C++/CUDA).
     """
 
     @staticmethod
@@ -49,16 +99,15 @@ class _PackedToPadded(Function):
         ctx.save_for_backward(first_idxs)
         ctx.num_inputs = int(inputs.shape[0])
         inputs, first_idxs = inputs.contiguous(), first_idxs.contiguous()
-        inputs_padded = _C.packed_to_padded(inputs, first_idxs, max_size)
+        inputs_padded = _packed_to_padded_forward(inputs, first_idxs, max_size)
         return inputs_padded
 
     @staticmethod
-    @once_differentiable
     def backward(ctx, grad_output):
         grad_output = grad_output.contiguous()
         first_idxs = ctx.saved_tensors[0]
         num_inputs = ctx.num_inputs
-        grad_input = _C.padded_to_packed(grad_output, first_idxs, num_inputs)
+        grad_input = _padded_to_packed_forward(grad_output, first_idxs, num_inputs)
         return grad_input, None, None
 
 
@@ -105,7 +154,8 @@ def packed_to_padded(
 
 class _PaddedToPacked(Function):
     """
-    Torch autograd Function wrapper for padded_to_packed C++/CUDA implementations.
+    Torch autograd Function wrapper for padded_to_packed.
+    Uses pure PyTorch implementation (no C++/CUDA).
     """
 
     @staticmethod
@@ -138,16 +188,15 @@ class _PaddedToPacked(Function):
         ctx.save_for_backward(first_idxs)
         ctx.max_size = inputs.shape[1]
         inputs, first_idxs = inputs.contiguous(), first_idxs.contiguous()
-        inputs_packed = _C.padded_to_packed(inputs, first_idxs, num_inputs)
+        inputs_packed = _padded_to_packed_forward(inputs, first_idxs, num_inputs)
         return inputs_packed
 
     @staticmethod
-    @once_differentiable
     def backward(ctx, grad_output):
         grad_output = grad_output.contiguous()
         first_idxs = ctx.saved_tensors[0]
         max_size = ctx.max_size
-        grad_input = _C.packed_to_padded(grad_output, first_idxs, max_size)
+        grad_input = _packed_to_padded_forward(grad_output, first_idxs, max_size)
         return grad_input, None, None
 
 

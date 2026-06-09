@@ -11,7 +11,6 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-from pytorch3d import _C
 
 from ..utils import parse_image_size
 from .clip import (
@@ -19,7 +18,10 @@ from .clip import (
     ClipFrustum,
     convert_clipped_rasterization_to_original_faces,
 )
-
+from .rasterize_meshes_warp import (
+    rasterize_meshes_warp_backward,
+    rasterize_meshes_warp_forward,
+)
 
 # TODO make the epsilon user configurable
 kEpsilon = 1e-8
@@ -293,8 +295,8 @@ class _RasterizeFaceVerts(torch.autograd.Function):
         z_clip_value: Optional[float] = None,
         cull_to_frustum: bool = True,
     ):
-        # pyre-fixme[16]: Module `pytorch3d` has no attribute `_C`.
-        pix_to_face, zbuf, barycentric_coords, dists = _C.rasterize_meshes(
+        # Try Warp kernel first; fall back to Python implementation
+        result = rasterize_meshes_warp_forward(
             face_verts,
             mesh_to_face_first_idx,
             num_faces_per_mesh,
@@ -307,7 +309,23 @@ class _RasterizeFaceVerts(torch.autograd.Function):
             perspective_correct,
             clip_barycentric_coords,
             cull_backfaces,
+            python_impl=_rasterize_face_verts_python,
         )
+        if result is None:
+            pix_to_face, zbuf, barycentric_coords, dists = _rasterize_face_verts_python(
+                face_verts,
+                mesh_to_face_first_idx,
+                num_faces_per_mesh,
+                clipped_faces_neighbor_idx,
+                image_size,
+                blur_radius,
+                faces_per_pixel,
+                perspective_correct,
+                clip_barycentric_coords,
+                cull_backfaces,
+            )
+        else:
+            pix_to_face, zbuf, barycentric_coords, dists = result
 
         ctx.save_for_backward(face_verts, pix_to_face)
         ctx.mark_non_differentiable(pix_to_face)
@@ -330,7 +348,9 @@ class _RasterizeFaceVerts(torch.autograd.Function):
         grad_clip_barycentric_coords = None
         grad_cull_backfaces = None
         face_verts, pix_to_face = ctx.saved_tensors
-        grad_face_verts = _C.rasterize_meshes_backward(
+
+        # Try Warp backward kernel first; fall back to Python implementation
+        grad_face_verts = rasterize_meshes_warp_backward(
             face_verts,
             pix_to_face,
             grad_zbuf,
@@ -338,7 +358,19 @@ class _RasterizeFaceVerts(torch.autograd.Function):
             grad_dists,
             ctx.perspective_correct,
             ctx.clip_barycentric_coords,
+            python_impl=_rasterize_face_verts_backward_python,
         )
+        if grad_face_verts is None:
+            grad_face_verts = _rasterize_face_verts_backward_python(
+                face_verts,
+                pix_to_face,
+                grad_zbuf,
+                grad_barycentric_coords,
+                grad_dists,
+                ctx.perspective_correct,
+                ctx.clip_barycentric_coords,
+            )
+
         grads = (
             grad_face_verts,
             grad_mesh_to_face_first_idx,
@@ -354,6 +386,216 @@ class _RasterizeFaceVerts(torch.autograd.Function):
             grad_cull_backfaces,
         )
         return grads
+
+
+def _rasterize_face_verts_python(
+    face_verts: torch.Tensor,
+    mesh_to_face_first_idx: torch.Tensor,
+    num_faces_per_mesh: torch.Tensor,
+    clipped_faces_neighbor_idx: torch.Tensor,
+    image_size: Union[Tuple[int, int], List[int]],
+    blur_radius: float,
+    faces_per_pixel: int,
+    perspective_correct: bool,
+    clip_barycentric_coords: bool,
+    cull_backfaces: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Pure Python implementation of face verts rasterization.
+    Same interface as C++ RasterizeMeshesNaive.
+    """
+    H, W = image_size[0], image_size[1]
+    N = mesh_to_face_first_idx.shape[0]
+    K = faces_per_pixel
+    device = face_verts.device
+    faces_verts = face_verts
+
+    face_idxs = torch.full((N, H, W, K), -1, dtype=torch.int64, device=device)
+    zbuf = torch.full((N, H, W, K), -1.0, dtype=torch.float32, device=device)
+    bary_coords = torch.full((N, H, W, K, 3), -1.0, dtype=torch.float32, device=device)
+    pix_dists = torch.full((N, H, W, K), -1.0, dtype=torch.float32, device=device)
+
+    x_mins = torch.min(faces_verts[:, :, 0], dim=1, keepdim=True).values
+    x_maxs = torch.max(faces_verts[:, :, 0], dim=1, keepdim=True).values
+    y_mins = torch.min(faces_verts[:, :, 1], dim=1, keepdim=True).values
+    y_maxs = torch.max(faces_verts[:, :, 1], dim=1, keepdim=True).values
+    z_mins = torch.min(faces_verts[:, :, 2], dim=1, keepdim=True).values
+    x_mins = x_mins - np.sqrt(blur_radius) - kEpsilon
+    x_maxs = x_maxs + np.sqrt(blur_radius) + kEpsilon
+    y_mins = y_mins - np.sqrt(blur_radius) - kEpsilon
+    y_maxs = y_maxs + np.sqrt(blur_radius) + kEpsilon
+
+    for n in range(N):
+        face_start_idx = mesh_to_face_first_idx[n].item()
+        face_stop_idx = face_start_idx + num_faces_per_mesh[n].item()
+        for yi in range(H):
+            yfix = H - 1 - yi
+            yf = pix_to_non_square_ndc(yfix, H, W)
+            for xi in range(W):
+                xfix = W - 1 - xi
+                xf = pix_to_non_square_ndc(xfix, W, H)
+                top_k_points = []
+                print("xi:", xi, "yi:", yi, "face_start_idx:", face_start_idx, "face_stop_idx:", face_stop_idx)
+                for f in range(face_start_idx, face_stop_idx):
+                    face = faces_verts[f]
+                    v0, v1, v2 = face.unbind(0)
+                    face_area = edge_function(v2, v0, v1)
+                    if cull_backfaces and face_area < 0:
+                        continue
+                    if face_area == 0.0:
+                        continue
+                    if (
+                        xf < x_mins[f].item()
+                        or xf > x_maxs[f].item()
+                        or yf < y_mins[f].item()
+                        or yf > y_maxs[f].item()
+                    ):
+                        continue
+                    if z_mins[f].item() < kEpsilon:
+                        continue
+                    pxy = torch.tensor([xf, yf], dtype=torch.float32, device=device)
+                    bary = barycentric_coordinates(pxy, v0[:2], v1[:2], v2[:2])
+                    if perspective_correct:
+                        z0, z1, z2 = v0[2], v1[2], v2[2]
+                        l0, l1, l2 = bary[0], bary[1], bary[2]
+                        top0 = l0 * z1 * z2
+                        top1 = z0 * l1 * z2
+                        top2 = z0 * z1 * l2
+                        bot = top0 + top1 + top2
+                        bary = (top0 / bot, top1 / bot, top2 / bot)
+                    inside = (
+                        bary[0].item() > 0.0 and bary[1].item() > 0.0 and bary[2].item() > 0.0
+                    )
+                    if clip_barycentric_coords:
+                        bary = barycentric_coordinates_clip(bary)
+                    pz = bary[0] * v0[2] + bary[1] * v1[2] + bary[2] * v2[2]
+                    if pz < 0:
+                        continue
+                    dist = point_triangle_distance(pxy, v0[:2], v1[:2], v2[:2])
+                    if not inside and dist.item() >= blur_radius:
+                        continue
+                    top_k_idx = -1
+                    if clipped_faces_neighbor_idx[f].item() != -1:
+                        neighbor_idx = clipped_faces_neighbor_idx[f].item()
+                        for i, val in enumerate(top_k_points):
+                            if val[1] == neighbor_idx:
+                                top_k_idx = i
+                                break
+                    dist_val = dist.item()
+                    if top_k_idx != -1 and dist_val < top_k_points[top_k_idx][3]:
+                        top_k_points[top_k_idx] = (pz.item(), f, bary, dist_val, inside)
+                    else:
+                        top_k_points.append((pz.item(), f, bary, dist_val, inside))
+                    top_k_points.sort()
+                    if len(top_k_points) > K:
+                        top_k_points = top_k_points[:K]
+                for k, (pz, f, bary, dist, inside) in enumerate(top_k_points):
+                    zbuf[n, yi, xi, k] = pz
+                    face_idxs[n, yi, xi, k] = f
+                    bary_coords[n, yi, xi, k, 0] = bary[0].item() if hasattr(bary[0], 'item') else bary[0]
+                    bary_coords[n, yi, xi, k, 1] = bary[1].item() if hasattr(bary[1], 'item') else bary[1]
+                    bary_coords[n, yi, xi, k, 2] = bary[2].item() if hasattr(bary[2], 'item') else bary[2]
+                    pix_dists[n, yi, xi, k] = -dist if inside else dist
+
+    return face_idxs, zbuf, bary_coords, pix_dists
+
+
+def _rasterize_face_verts_backward_python(
+    face_verts: torch.Tensor,
+    pix_to_face: torch.Tensor,
+    grad_zbuf: torch.Tensor,
+    grad_barycentric_coords: torch.Tensor,
+    grad_dists: torch.Tensor,
+    perspective_correct: bool,
+    clip_barycentric_coords: bool,
+) -> torch.Tensor:
+    """
+    Pure Python backward for rasterize_face_verts.
+    Accumulates gradients per pixel using the C++ backward formulas.
+    """
+    N, H, W, K = pix_to_face.shape
+    device = face_verts.device
+    grad_face_verts = torch.zeros_like(face_verts)
+
+    for n in range(N):
+        for pix_idx in range(H * W):
+            yi = H - 1 - pix_idx // W
+            xi = W - 1 - pix_idx % W
+            xf = pix_to_non_square_ndc(xi, W, H)
+            yf = pix_to_non_square_ndc(yi, H, W)
+            pxy = torch.tensor([xf, yf], dtype=torch.float32, device=device)
+
+            for k in range(K):
+                i = n * H * W * K + pix_idx * K + k
+                f = pix_to_face[n, yi, xi, k].item()
+                if f < 0:
+                    continue
+
+                v0 = face_verts[f, 0]
+                v1 = face_verts[f, 1]
+                v2 = face_verts[f, 2]
+                v0xy = v0[:2]
+                v1xy = v1[:2]
+                v2xy = v2[:2]
+
+                grad_dist_up = grad_dists[n, yi, xi, k].item()
+                grad_zbuf_up = grad_zbuf[n, yi, xi, k].item()
+                grad_bary_up = grad_barycentric_coords[n, yi, xi, k]
+
+                b_w = barycentric_coordinates(pxy, v0xy, v1xy, v2xy)
+                b_w = (b_w[0], b_w[1], b_w[2])
+                if perspective_correct:
+                    z0, z1, z2 = v0[2], v1[2], v2[2]
+                    top0 = b_w[0] * z1 * z2
+                    top1 = z0 * b_w[1] * z2
+                    top2 = z0 * z1 * b_w[2]
+                    bot = max(top0 + top1 + top2, kEpsilon)
+                    b_pp = (top0 / bot, top1 / bot, top2 / bot)
+                else:
+                    b_pp = b_w
+                b_pp = (b_pp[0], b_pp[1], b_pp[2])
+                inside = b_pp[0] > 0 and b_pp[1] > 0 and b_pp[2] > 0
+                sign = -1.0 if inside else 1.0
+
+                if clip_barycentric_coords:
+                    b_w_clip = barycentric_coordinates_clip(b_pp)
+                else:
+                    b_w_clip = b_pp
+
+                grad_dist = sign * grad_dist_up
+                ddist_dv0, ddist_dv1, ddist_dv2 = _point_triangle_distance_backward(
+                    pxy, v0xy, v1xy, v2xy, torch.tensor(grad_dist, device=device)
+                )
+                d_zbuf_d_bwclip = torch.stack([v0[2], v1[2], v2[2]])
+                grad_bary_f_sum = grad_bary_up + grad_zbuf_up * d_zbuf_d_bwclip
+
+                grad_bary0 = grad_bary_f_sum
+                if clip_barycentric_coords:
+                    grad_bary0 = _barycentric_clip_backward(
+                        torch.stack(b_pp), grad_bary_f_sum
+                    )
+
+                dz0_persp = dz1_persp = dz2_persp = 0.0
+                if perspective_correct:
+                    grad_bary0, dz0_persp, dz1_persp, dz2_persp = (
+                        _barycentric_perspective_correction_backward(
+                            torch.stack(b_w), v0[2], v1[2], v2[2], grad_bary0
+                        )
+                    )
+
+                dbary_dv0, dbary_dv1, dbary_dv2 = _barycentric_coords_backward(
+                    pxy, v0xy, v1xy, v2xy, grad_bary0
+                )
+
+                b_w_clip_t = torch.stack([b_w_clip[0], b_w_clip[1], b_w_clip[2]])
+                grad_face_verts[f, 0, :2] += dbary_dv0 + ddist_dv0
+                grad_face_verts[f, 0, 2] += grad_zbuf_up * b_w_clip_t[0] + dz0_persp
+                grad_face_verts[f, 1, :2] += dbary_dv1 + ddist_dv1
+                grad_face_verts[f, 1, 2] += grad_zbuf_up * b_w_clip_t[1] + dz1_persp
+                grad_face_verts[f, 2, :2] += dbary_dv2 + ddist_dv2
+                grad_face_verts[f, 2, 2] += grad_zbuf_up * b_w_clip_t[2] + dz2_persp
+
+    return grad_face_verts
 
 
 def non_square_ndc_range(S1, S2):
@@ -411,7 +653,7 @@ def rasterize_meshes_python(  # noqa: C901
     z_clip_value: Optional[float] = None,
     cull_to_frustum: bool = True,
     clipped_faces_neighbor_idx: Optional[torch.Tensor] = None,
-):
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Naive PyTorch implementation of mesh rasterization with the same inputs and
     outputs as the rasterize_meshes function.
@@ -742,6 +984,139 @@ def point_line_distance(p, v0, v1):
     p_proj = v0 + t * v1v0
     delta_p = p_proj - p
     return delta_p.dot(delta_p)
+
+
+def _edge_function_backward(p, v0, v1, grad_edge):
+    """Backward of edge_function. Returns (d_edge_dp, d_edge_dv0, d_edge_dv1)."""
+    dedge_dp = torch.stack([v1[1] - v0[1], v0[0] - v1[0]])
+    dedge_dv0 = torch.stack([p[1] - v1[1], v1[0] - p[0]])
+    dedge_dv1 = torch.stack([v0[1] - p[1], p[0] - v0[0]])
+    return grad_edge * dedge_dp, grad_edge * dedge_dv0, grad_edge * dedge_dv1
+
+
+def _barycentric_coords_backward(p, v0, v1, v2, grad_bary):
+    """Backward of barycentric_coordinates. Returns (dbary_dv0, dbary_dv1, dbary_dv2)."""
+    area = edge_function(v2, v0, v1) + kEpsilon
+    area2 = area * area
+    e0 = edge_function(p, v1, v2)
+    e1 = edge_function(p, v2, v0)
+    e2 = edge_function(p, v0, v1)
+    g0, g1, g2 = grad_bary[0], grad_bary[1], grad_bary[2]
+    dw0_darea = -e0 / area2
+    dw0_e0 = 1.0 / area
+    dloss_dw0area = g0 * dw0_darea
+    dloss_e0 = g0 * dw0_e0
+    de0_dp, de0_dv1, de0_dv2 = _edge_function_backward(p, v1, v2, dloss_e0)
+    dw0area_dv0, dw0area_dv1, dw0area_dv2 = _edge_function_backward(v2, v0, v1, dloss_dw0area)
+    dw0_dv0 = dw0area_dv0
+    dw0_dv1 = de0_dv1 + dw0area_dv1
+    dw0_dv2 = de0_dv2 + dw0area_dv2
+    dw1_darea = -e1 / area2
+    dloss_dw1area = g1 * dw1_darea
+    dloss_e1 = g1 / area
+    de1_dp, de1_dv2, de1_dv0 = _edge_function_backward(p, v2, v0, dloss_e1)
+    dw1area_dv0, dw1area_dv1, dw1area_dv2 = _edge_function_backward(v2, v0, v1, dloss_dw1area)
+    dw1_dv0 = de1_dv0 + dw1area_dv0
+    dw1_dv1 = dw1area_dv1
+    dw1_dv2 = de1_dv2 + dw1area_dv2
+    dw2_darea = -e2 / area2
+    dloss_dw2area = g2 * dw2_darea
+    dloss_e2 = g2 / area
+    de2_dp, de2_dv0, de2_dv1 = _edge_function_backward(p, v0, v1, dloss_e2)
+    dw2area_dv0, dw2area_dv1, dw2area_dv2 = _edge_function_backward(v2, v0, v1, dloss_dw2area)
+    dw2_dv0 = de2_dv0 + dw2area_dv0
+    dw2_dv1 = de2_dv1 + dw2area_dv1
+    dw2_dv2 = dw2area_dv2
+    return dw0_dv0 + dw1_dv0 + dw2_dv0, dw0_dv1 + dw1_dv1 + dw2_dv1, dw0_dv2 + dw1_dv2 + dw2_dv2
+
+
+def _barycentric_perspective_correction_backward(bary, z0, z1, z2, grad_out):
+    """Backward of perspective correction. Returns (grad_bary, grad_z0, grad_z1, grad_z2)."""
+    w0_top = bary[0] * z1 * z2
+    w1_top = z0 * bary[1] * z2
+    w2_top = z0 * z1 * bary[2]
+    denom = max(w0_top + w1_top + w2_top, kEpsilon)
+    grad_denom_top = -(w0_top * grad_out[0] + w1_top * grad_out[1] + w2_top * grad_out[2])
+    grad_denom = grad_denom_top / (denom * denom)
+    grad_w0_top = grad_denom + grad_out[0] / denom
+    grad_w1_top = grad_denom + grad_out[1] / denom
+    grad_w2_top = grad_denom + grad_out[2] / denom
+    grad_bary = torch.stack([
+        grad_w0_top * z1 * z2,
+        grad_w1_top * z0 * z2,
+        grad_w2_top * z0 * z1,
+    ])
+    grad_z0 = grad_w1_top * bary[1] * z2 + grad_w2_top * bary[2] * z1
+    grad_z1 = grad_w0_top * bary[0] * z2 + grad_w2_top * bary[2] * z0
+    grad_z2 = grad_w0_top * bary[0] * z1 + grad_w1_top * bary[1] * z0
+    return grad_bary, grad_z0, grad_z1, grad_z2
+
+
+def _barycentric_clip_backward(bary, grad_baryclip):
+    """Backward of barycentric_coordinates_clip."""
+    bary_t = torch.stack([bary[0], bary[1], bary[2]]) if not isinstance(bary, torch.Tensor) else bary
+    w0 = torch.clamp(bary_t[0], min=0.0)
+    w1 = torch.clamp(bary_t[1], min=0.0)
+    w2 = torch.clamp(bary_t[2], min=0.0)
+    w_sum = torch.clamp(w0 + w1 + w2, min=1e-5)
+    grad_sum_clip = 1.0 if w_sum.item() >= 1e-5 else 0.0
+    grad_sum = torch.stack([
+        -w0 / (w_sum * w_sum) * grad_sum_clip,
+        -w1 / (w_sum * w_sum) * grad_sum_clip,
+        -w2 / (w_sum * w_sum) * grad_sum_clip,
+    ])
+    grad_clip = (bary_t >= 0).float()
+    g0 = grad_clip[0] * (
+        grad_baryclip[0] * (1.0 / w_sum + grad_sum[0])
+        + grad_baryclip[1] * grad_sum[1]
+        + grad_baryclip[2] * grad_sum[2]
+    )
+    g1 = grad_clip[1] * (
+        grad_baryclip[1] * (1.0 / w_sum + grad_sum[1])
+        + grad_baryclip[0] * grad_sum[0]
+        + grad_baryclip[2] * grad_sum[2]
+    )
+    g2 = grad_clip[2] * (
+        grad_baryclip[2] * (1.0 / w_sum + grad_sum[2])
+        + grad_baryclip[0] * grad_sum[0]
+        + grad_baryclip[1] * grad_sum[1]
+    )
+    return torch.stack([g0, g1, g2])
+
+
+def _point_line_distance_backward(p, v0, v1, grad_dist):
+    """Backward of point_line_distance. Returns (grad_p, grad_v0, grad_v1)."""
+    v1v0 = v1 - v0
+    pv0 = p - v0
+    t_bot = v1v0.dot(v1v0)
+    t_top = v1v0.dot(pv0)
+    if t_bot <= kEpsilon:
+        return torch.zeros_like(p), torch.zeros_like(v0), torch.zeros_like(v1)
+    tt = torch.clamp(t_top / t_bot, min=0.0, max=1.0)
+    p_proj = v0 + tt * v1v0
+    diff = p_proj - p
+    grad_base = grad_dist * 2.0 * diff
+    grad_p = -grad_base
+    grad_v0 = grad_dist * (1.0 - tt) * 2.0 * diff
+    grad_v1 = grad_dist * tt * 2.0 * diff
+    return grad_p, grad_v0, grad_v1
+
+
+def _point_triangle_distance_backward(p, v0, v1, v2, grad_dist):
+    """Backward of point_triangle_distance. Returns (grad_v0, grad_v1, grad_v2)."""
+    e01 = point_line_distance(p, v0, v1)
+    e02 = point_line_distance(p, v0, v2)
+    e12 = point_line_distance(p, v1, v2)
+    gv0 = torch.zeros_like(v0)
+    gv1 = torch.zeros_like(v1)
+    gv2 = torch.zeros_like(v2)
+    if e01.item() <= e02.item() and e01.item() <= e12.item():
+        _, gv0, gv1 = _point_line_distance_backward(p, v0, v1, grad_dist)
+    elif e02.item() <= e01.item() and e02.item() <= e12.item():
+        _, gv0, gv2 = _point_line_distance_backward(p, v0, v2, grad_dist)
+    else:
+        _, gv1, gv2 = _point_line_distance_backward(p, v1, v2, grad_dist)
+    return gv0, gv1, gv2
 
 
 def point_triangle_distance(p, v0, v1, v2):

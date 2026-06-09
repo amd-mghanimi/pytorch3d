@@ -18,8 +18,22 @@ import warnings
 from typing import Optional, Tuple, Union
 
 import torch
-from pytorch3d import _C
 from pytorch3d.transforms import axis_angle_to_matrix, rotation_6d_to_matrix
+
+from .pulsar_pytorch import (
+    PULSAR_EPS,
+    PULSAR_MAX_UINT,
+    PulsarRendererPython,
+    pulsar_sphere_ids_from_result_info_nograd as _pulsar_sphere_ids_python,
+)
+
+try:
+    from pytorch3d import _C
+
+    _C_AVAILABLE = True
+except ImportError:
+    _C = None
+    _C_AVAILABLE = False
 
 
 LOGGER = logging.getLogger(__name__)
@@ -109,8 +123,7 @@ class _Render(torch.autograd.Function):
         bg_col=None,
         opacity=None,
         percent_allowed_difference=0.01,
-        # pyre-fixme[16]: Module `_C` has no attribute `MAX_UINT`.
-        max_n_hits=_C.MAX_UINT,
+        max_n_hits=PULSAR_MAX_UINT,
         mode=0,
         return_forward_info=False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -127,7 +140,7 @@ class _Render(torch.autograd.Function):
         ctx.max_n_hits = max_n_hits
         ctx.mode = mode
         ctx.native_renderer = native_renderer
-        image, info = ctx.native_renderer.forward(
+        image, info = native_renderer.forward(
             vert_pos,
             vert_col,
             vert_rad,
@@ -326,23 +339,33 @@ class Renderer(torch.nn.Module):
         max_num_balls: int,
         orthogonal_projection: bool = False,
         right_handed_system: bool = False,
-        # pyre-fixme[16]: Module `_C` has no attribute `EPS`.
-        background_normalized_depth: float = _C.EPS,
+        background_normalized_depth: float = PULSAR_EPS,
         n_channels: int = 3,
         n_track: int = 5,
     ) -> None:
         super(Renderer, self).__init__()
-        # pyre-fixme[16]: Module `pytorch3d` has no attribute `_C`.
-        self._renderer = _C.PulsarRenderer(
-            width,
-            height,
-            max_num_balls,
-            orthogonal_projection,
-            right_handed_system,
-            background_normalized_depth,
-            n_channels,
-            n_track,
-        )
+        if _C_AVAILABLE:
+            self._renderer = _C.PulsarRenderer(
+                width,
+                height,
+                max_num_balls,
+                orthogonal_projection,
+                right_handed_system,
+                background_normalized_depth,
+                n_channels,
+                n_track,
+            )
+        else:
+            self._renderer = PulsarRendererPython(
+                width,
+                height,
+                max_num_balls,
+                orthogonal_projection,
+                right_handed_system,
+                background_normalized_depth,
+                n_channels,
+                n_track,
+            )
         self.register_buffer("device_tracker", torch.zeros(1))
 
     @staticmethod
@@ -352,8 +375,9 @@ class Renderer(torch.nn.Module):
         """
         if result_info.ndim == 3:
             return Renderer.sphere_ids_from_result_info_nograd(result_info[None, ...])
-        # pyre-fixme[16]: Module `pytorch3d` has no attribute `_C`.
-        return _C.pulsar_sphere_ids_from_result_info_nograd(result_info)
+        if _C_AVAILABLE:
+            return _C.pulsar_sphere_ids_from_result_info_nograd(result_info)
+        return _pulsar_sphere_ids_python(result_info)
 
     @staticmethod
     def depth_map_from_result_info_nograd(result_info: torch.Tensor) -> torch.Tensor:
@@ -545,8 +569,7 @@ class Renderer(torch.nn.Module):
         bg_col: Optional[torch.Tensor] = None,
         opacity: Optional[torch.Tensor] = None,
         percent_allowed_difference: float = 0.01,
-        # pyre-fixme[16]: Module `_C` has no attribute `MAX_UINT`.
-        max_n_hits: int = _C.MAX_UINT,
+        max_n_hits: int = PULSAR_MAX_UINT,
         mode: int = 0,
         return_forward_info: bool = False,
         first_R_then_T: bool = False,

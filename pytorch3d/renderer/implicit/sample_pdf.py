@@ -8,7 +8,14 @@
 
 
 import torch
-from pytorch3d import _C
+
+try:
+    from pytorch3d import _C
+
+    _C_AVAILABLE = True
+except ImportError:
+    _C = None
+    _C_AVAILABLE = False
 
 
 def sample_pdf(
@@ -49,21 +56,22 @@ def sample_pdf(
         raise ValueError("Inconsistent shapes of bins and weights: " + shapes)
     output_shape = batch_shape + (n_samples,)
 
-    if det:
-        u = torch.linspace(0.0, 1.0, n_samples, device=bins.device, dtype=torch.float32)
-        output = u.expand(output_shape).contiguous()
+    if _C_AVAILABLE:
+        if det:
+            u = torch.linspace(0.0, 1.0, n_samples, device=bins.device, dtype=torch.float32)
+            output = u.expand(output_shape).contiguous()
+        else:
+            output = torch.rand(output_shape, dtype=torch.float32, device=bins.device)
+
+        _C.sample_pdf(
+            bins.reshape(-1, n_bins + 1),
+            weights.reshape(-1, n_bins),
+            output.reshape(-1, n_samples),
+            eps,
+        )
+        return output
     else:
-        output = torch.rand(output_shape, dtype=torch.float32, device=bins.device)
-
-    # pyre-fixme[16]: Module `pytorch3d` has no attribute `_C`.
-    _C.sample_pdf(
-        bins.reshape(-1, n_bins + 1),
-        weights.reshape(-1, n_bins),
-        output.reshape(-1, n_samples),
-        eps,
-    )
-
-    return output
+        return sample_pdf_python(bins, weights, n_samples, det=det, eps=eps)
 
 
 def sample_pdf_python(

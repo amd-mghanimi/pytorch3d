@@ -7,7 +7,205 @@
 # pyre-unsafe
 
 import torch
-from pytorch3d import _C
+
+
+# Epsilon for numerical stability
+_EPS = 1e-9
+_EPS_NORM = 1e-4
+
+
+def _accum_alphacomposite_python(features, alphas, points_idx):
+    """Pure PyTorch alpha composite forward."""
+    B, K, H, W = points_idx.shape
+    C = features.shape[0]
+    device = features.device
+    dtype = features.dtype
+
+    result = torch.zeros(B, C, H, W, dtype=dtype, device=device)
+    for b in range(B):
+        for c in range(C):
+            for j in range(H):
+                for i in range(W):
+                    cum_alpha = 1.0
+                    for k in range(K):
+                        n_idx = points_idx[b, k, j, i].item()
+                        if n_idx < 0:
+                            continue
+                        alpha = alphas[b, k, j, i]
+                        result[b, c, j, i] = result[b, c, j, i] + (
+                            cum_alpha * alpha * features[c, n_idx]
+                        )
+                        cum_alpha = cum_alpha * (1.0 - alpha)
+    return result
+
+
+def _accum_alphacomposite_backward_python(grad_output, features, alphas, points_idx):
+    """Pure PyTorch alpha composite backward."""
+    B, K, H, W = points_idx.shape
+    C = features.shape[0]
+    device = features.device
+    dtype = features.dtype
+
+    grad_features = torch.zeros_like(features)
+    grad_alphas = torch.zeros_like(alphas)
+
+    for b in range(B):
+        for c in range(C):
+            for j in range(H):
+                for i in range(W):
+                    cum_alpha = 1.0
+                    for k in range(K):
+                        n_idx = points_idx[b, k, j, i].item()
+                        if n_idx < 0:
+                            continue
+                        alpha = alphas[b, k, j, i]
+                        grad_alphas[b, k, j, i] = grad_alphas[b, k, j, i] + (
+                            grad_output[b, c, j, i] * features[c, n_idx] * cum_alpha
+                        )
+                        grad_features[c, n_idx] = grad_features[c, n_idx] + (
+                            grad_output[b, c, j, i] * cum_alpha * alpha
+                        )
+                        for t in range(k):
+                            t_idx = points_idx[b, t, j, i].item()
+                            if t_idx < 0:
+                                continue
+                            alpha_t = alphas[b, t, j, i]
+                            grad_alphas[b, t, j, i] = grad_alphas[b, t, j, i] - (
+                                grad_output[b, c, j, i]
+                                * features[c, n_idx]
+                                * cum_alpha
+                                * alpha
+                                / (1.0 - alpha_t + _EPS)
+                            )
+                        cum_alpha = cum_alpha * (1.0 - alpha)
+
+    return grad_features, grad_alphas
+
+
+def _accum_weightedsum_python(features, alphas, points_idx):
+    """Pure PyTorch weighted sum forward."""
+    B, K, H, W = points_idx.shape
+    C = features.shape[0]
+    device = features.device
+    dtype = features.dtype
+
+    result = torch.zeros(B, C, H, W, dtype=dtype, device=device)
+    for b in range(B):
+        for c in range(C):
+            for j in range(H):
+                for i in range(W):
+                    for k in range(K):
+                        n_idx = points_idx[b, k, j, i].item()
+                        if n_idx < 0:
+                            continue
+                        alpha = alphas[b, k, j, i]
+                        result[b, c, j, i] = result[b, c, j, i] + (
+                            alpha * features[c, n_idx]
+                        )
+    return result
+
+
+def _accum_weightedsum_backward_python(grad_output, features, alphas, points_idx):
+    """Pure PyTorch weighted sum backward."""
+    B, K, H, W = points_idx.shape
+    C = features.shape[0]
+    device = features.device
+
+    grad_features = torch.zeros_like(features)
+    grad_alphas = torch.zeros_like(alphas)
+
+    for b in range(B):
+        for c in range(C):
+            for j in range(H):
+                for i in range(W):
+                    for k in range(K):
+                        n_idx = points_idx[b, k, j, i].item()
+                        if n_idx < 0:
+                            continue
+                        alpha = alphas[b, k, j, i]
+                        grad_alphas[b, k, j, i] = grad_alphas[b, k, j, i] + (
+                            grad_output[b, c, j, i] * features[c, n_idx]
+                        )
+                        grad_features[c, n_idx] = grad_features[c, n_idx] + (
+                            grad_output[b, c, j, i] * alpha
+                        )
+
+    return grad_features, grad_alphas
+
+
+def _accum_weightedsumnorm_python(features, alphas, points_idx):
+    """Pure PyTorch normalized weighted sum forward."""
+    B, K, H, W = points_idx.shape
+    C = features.shape[0]
+    device = features.device
+    dtype = features.dtype
+
+    result = torch.zeros(B, C, H, W, dtype=dtype, device=device)
+    for b in range(B):
+        for c in range(C):
+            for j in range(H):
+                for i in range(W):
+                    t_alpha = torch.tensor(0.0, dtype=dtype, device=device)
+                    for k in range(K):
+                        n_idx = points_idx[b, k, j, i].item()
+                        if n_idx < 0:
+                            continue
+                        t_alpha = t_alpha + alphas[b, k, j, i]
+
+                    t_alpha_val = max(t_alpha.item(), _EPS_NORM)
+
+                    for k in range(K):
+                        n_idx = points_idx[b, k, j, i].item()
+                        if n_idx < 0:
+                            continue
+                        alpha = alphas[b, k, j, i]
+                        result[b, c, j, i] = result[b, c, j, i] + (
+                            alpha * features[c, n_idx] / t_alpha_val
+                        )
+    return result
+
+
+def _accum_weightedsumnorm_backward_python(grad_output, features, alphas, points_idx):
+    """Pure PyTorch normalized weighted sum backward."""
+    B, K, H, W = points_idx.shape
+    C = features.shape[0]
+    device = features.device
+    dtype = features.dtype
+
+    grad_features = torch.zeros_like(features)
+    grad_alphas = torch.zeros_like(alphas)
+
+    for b in range(B):
+        for c in range(C):
+            for j in range(H):
+                for i in range(W):
+                    t_alpha = torch.tensor(0.0, dtype=dtype, device=device)
+                    t_alphafs = torch.tensor(0.0, dtype=dtype, device=device)
+                    for k in range(K):
+                        n_idx = points_idx[b, k, j, i].item()
+                        if n_idx < 0:
+                            continue
+                        t_alpha = t_alpha + alphas[b, k, j, i]
+                        t_alphafs = t_alphafs + alphas[b, k, j, i] * features[c, n_idx]
+
+                    t_alpha_val = max(t_alpha.item(), _EPS_NORM)
+                    t_alphafs_val = t_alphafs.item()
+
+                    for k in range(K):
+                        n_idx = points_idx[b, k, j, i].item()
+                        if n_idx < 0:
+                            continue
+                        alpha = alphas[b, k, j, i]
+                        grad_alphas[b, k, j, i] = grad_alphas[b, k, j, i] + (
+                            grad_output[b, c, j, i]
+                            * (features[c, n_idx] * t_alpha_val - t_alphafs_val)
+                            / (t_alpha_val * t_alpha_val)
+                        )
+                        grad_features[c, n_idx] = grad_features[c, n_idx] + (
+                            grad_output[b, c, j, i] * alpha / t_alpha_val
+                        )
+
+    return grad_features, grad_alphas
 
 
 # Example functions for blending the top K features per pixel using the outputs
@@ -45,8 +243,7 @@ class _CompositeAlphaPoints(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, features, alphas, points_idx):
-        pt_cld = _C.accum_alphacomposite(features, alphas, points_idx)
-
+        pt_cld = _accum_alphacomposite_python(features, alphas, points_idx)
         ctx.save_for_backward(features.clone(), alphas.clone(), points_idx.clone())
         return pt_cld
 
@@ -57,7 +254,7 @@ class _CompositeAlphaPoints(torch.autograd.Function):
         grad_points_idx = None
         features, alphas, points_idx = ctx.saved_tensors
 
-        grad_features, grad_alphas = _C.accum_alphacomposite_backward(
+        grad_features, grad_alphas = _accum_alphacomposite_backward_python(
             grad_output, features, alphas, points_idx
         )
 
@@ -124,8 +321,7 @@ class _CompositeNormWeightedSumPoints(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, features, alphas, points_idx):
-        pt_cld = _C.accum_weightedsumnorm(features, alphas, points_idx)
-
+        pt_cld = _accum_weightedsumnorm_python(features, alphas, points_idx)
         ctx.save_for_backward(features.clone(), alphas.clone(), points_idx.clone())
         return pt_cld
 
@@ -136,7 +332,7 @@ class _CompositeNormWeightedSumPoints(torch.autograd.Function):
         grad_points_idx = None
         features, alphas, points_idx = ctx.saved_tensors
 
-        grad_features, grad_alphas = _C.accum_weightedsumnorm_backward(
+        grad_features, grad_alphas = _accum_weightedsumnorm_backward_python(
             grad_output, features, alphas, points_idx
         )
 
@@ -202,8 +398,7 @@ class _CompositeWeightedSumPoints(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, features, alphas, points_idx):
-        pt_cld = _C.accum_weightedsum(features, alphas, points_idx)
-
+        pt_cld = _accum_weightedsum_python(features, alphas, points_idx)
         ctx.save_for_backward(features.clone(), alphas.clone(), points_idx.clone())
         return pt_cld
 
@@ -214,7 +409,7 @@ class _CompositeWeightedSumPoints(torch.autograd.Function):
         grad_points_idx = None
         features, alphas, points_idx = ctx.saved_tensors
 
-        grad_features, grad_alphas = _C.accum_weightedsum_backward(
+        grad_features, grad_alphas = _accum_weightedsum_backward_python(
             grad_output, features, alphas, points_idx
         )
 

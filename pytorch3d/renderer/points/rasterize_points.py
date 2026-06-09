@@ -10,10 +10,17 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-from pytorch3d import _C
 from pytorch3d.renderer.mesh.rasterize_meshes import pix_to_non_square_ndc
 
 from ..utils import parse_image_size
+
+try:
+    from pytorch3d import _C
+
+    _C_AVAILABLE = True
+except ImportError:
+    _C = None
+    _C_AVAILABLE = False
 
 
 # Maximum number of faces per bins for
@@ -184,6 +191,100 @@ def _format_radius(
     return radius
 
 
+def _rasterize_points_packed_python(
+    points: torch.Tensor,
+    cloud_to_packed_first_idx: torch.Tensor,
+    num_points_per_cloud: torch.Tensor,
+    image_size: Union[List[int], Tuple[int, int]],
+    radius: torch.Tensor,
+    points_per_pixel: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pure Python rasterize_points forward (naive, bin_size=0 only)."""
+    N = cloud_to_packed_first_idx.shape[0]
+    H, W = image_size[0], image_size[1]
+    K = points_per_pixel
+    device = points.device
+
+    point_idxs = torch.full((N, H, W, K), -1, dtype=torch.int32, device=device)
+    zbuf = torch.full((N, H, W, K), -1.0, dtype=torch.float32, device=device)
+    pix_dists = torch.full((N, H, W, K), -1.0, dtype=torch.float32, device=device)
+    radius2 = radius * radius
+
+    for n in range(N):
+        point_start_idx = cloud_to_packed_first_idx[n].item()
+        point_stop_idx = point_start_idx + num_points_per_cloud[n].item()
+
+        for yi in range(H):
+            yfix = H - 1 - yi
+            yf = pix_to_non_square_ndc(yfix, H, W)
+            for xi in range(W):
+                xfix = W - 1 - xi
+                xf = pix_to_non_square_ndc(xfix, W, H)
+                top_k_points = []
+                for p in range(point_start_idx, point_stop_idx):
+                    px, py, pz = points[p, 0].item(), points[p, 1].item(), points[p, 2].item()
+                    r2 = radius2[p].item()
+                    if pz < 0:
+                        continue
+                    dx = px - xf
+                    dy = py - yf
+                    dist2 = dx * dx + dy * dy
+                    if dist2 < r2:
+                        top_k_points.append((pz, p, dist2))
+                        top_k_points.sort()
+                        if len(top_k_points) > K:
+                            top_k_points = top_k_points[:K]
+                for k, (pz, p, dist2) in enumerate(top_k_points):
+                    zbuf[n, yi, xi, k] = pz
+                    point_idxs[n, yi, xi, k] = p
+                    pix_dists[n, yi, xi, k] = dist2
+
+    return point_idxs, zbuf, pix_dists
+
+
+def _rasterize_points_backward_python(
+    points: torch.Tensor,
+    idx: torch.Tensor,
+    grad_zbuf: Optional[torch.Tensor],
+    grad_dists: Optional[torch.Tensor],
+    image_size: Union[List[int], Tuple[int, int]],
+) -> torch.Tensor:
+    """Pure Python rasterize_points backward."""
+    N, H, W, K = idx.shape
+    device = points.device
+    if grad_zbuf is None:
+        grad_zbuf = torch.zeros(N, H, W, K, dtype=torch.float32, device=device)
+    if grad_dists is None:
+        grad_dists = torch.zeros(N, H, W, K, dtype=torch.float32, device=device)
+
+    grad_points = torch.zeros_like(points)
+
+    for n in range(N):
+        for y in range(H):
+            yidx = H - 1 - y
+            yf = pix_to_non_square_ndc(yidx, H, W)
+            for x in range(W):
+                xidx = W - 1 - x
+                xf = pix_to_non_square_ndc(xidx, W, H)
+                for k in range(K):
+                    p = idx[n, y, x, k].item()
+                    if p < 0:
+                        break
+                    grad_dist2 = grad_dists[n, y, x, k].item()
+                    grad_z = grad_zbuf[n, y, x, k].item()
+                    px = points[p, 0].item()
+                    py = points[p, 1].item()
+                    dx = px - xf
+                    dy = py - yf
+                    grad_px = 2.0 * grad_dist2 * dx
+                    grad_py = 2.0 * grad_dist2 * dy
+                    grad_points[p, 0] += grad_px
+                    grad_points[p, 1] += grad_py
+                    grad_points[p, 2] += grad_z
+
+    return grad_points
+
+
 class _RasterizePoints(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -199,20 +300,35 @@ class _RasterizePoints(torch.autograd.Function):
     ):
         # TODO: Add better error handling for when there are more than
         # max_points_per_bin in any bin.
-        args = (
-            points,
-            cloud_to_packed_first_idx,
-            num_points_per_cloud,
-            image_size,
-            radius,
-            points_per_pixel,
-            bin_size,
-            max_points_per_bin,
-        )
-        # pyre-fixme[16]: Module `pytorch3d` has no attribute `_C`.
-        idx, zbuf, dists = _C.rasterize_points(*args)
+        if _C_AVAILABLE:
+            args = (
+                points,
+                cloud_to_packed_first_idx,
+                num_points_per_cloud,
+                image_size,
+                radius,
+                points_per_pixel,
+                bin_size,
+                max_points_per_bin,
+            )
+            idx, zbuf, dists = _C.rasterize_points(*args)
+        else:
+            if bin_size > 0:
+                raise ValueError(
+                    "Coarse-to-fine rasterization (bin_size > 0) requires the "
+                    "C++ extension. Install pytorch3d with the extension or use bin_size=0."
+                )
+            idx, zbuf, dists = _rasterize_points_packed_python(
+                points,
+                cloud_to_packed_first_idx,
+                num_points_per_cloud,
+                image_size,
+                radius,
+                points_per_pixel,
+            )
         ctx.save_for_backward(points, idx)
         ctx.mark_non_differentiable(idx)
+        ctx.image_size = image_size
         return idx, zbuf, dists
 
     @staticmethod
@@ -226,8 +342,14 @@ class _RasterizePoints(torch.autograd.Function):
         grad_bin_size = None
         grad_max_points_per_bin = None
         points, idx = ctx.saved_tensors
-        args = (points, idx, grad_zbuf, grad_dists)
-        grad_points = _C.rasterize_points_backward(*args)
+        if _C_AVAILABLE:
+            grad_points = _C.rasterize_points_backward(
+                points, idx, grad_zbuf, grad_dists
+            )
+        else:
+            grad_points = _rasterize_points_backward_python(
+                points, idx, grad_zbuf, grad_dists, ctx.image_size
+            )
         grads = (
             grad_points,
             grad_cloud_to_packed_first_idx,

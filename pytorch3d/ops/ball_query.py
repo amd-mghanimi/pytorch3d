@@ -9,25 +9,64 @@
 from typing import Union
 
 import torch
-from pytorch3d import _C
 from torch.autograd import Function
 from torch.autograd.function import once_differentiable
 
-from .knn import _KNN
+from .knn import _KNN, _knn_points_backward_python
 from .utils import masked_gather
+
+
+def _ball_query_forward(
+    p1: torch.Tensor,
+    p2: torch.Tensor,
+    lengths1: torch.Tensor,
+    lengths2: torch.Tensor,
+    K: int,
+    radius: float,
+    skip_points_outside_cube: bool,
+) -> tuple:
+    """
+    Pure PyTorch implementation of ball query forward.
+    Finds up to K points in p2 within radius of each point in p1.
+    """
+    N, P1, D = p1.shape
+    P2 = p2.shape[1]
+    radius2 = radius * radius
+
+    idx = torch.full((N, P1, K), -1, dtype=torch.int64, device=p1.device)
+    dists = torch.zeros((N, P1, K), dtype=p1.dtype, device=p1.device)
+
+    for n in range(N):
+        len1 = lengths1[n].item()
+        len2 = lengths2[n].item()
+        for i in range(len1):
+            count = 0
+            for j in range(len2):
+                if count >= K:
+                    break
+                if skip_points_outside_cube:
+                    if (torch.abs(p1[n, i] - p2[n, j]) > radius).any():
+                        continue
+                diff = p1[n, i] - p2[n, j]
+                dist2 = (diff * diff).sum().item()
+                if dist2 < radius2:
+                    idx[n, i, count] = j
+                    dists[n, i, count] = dist2
+                    count += 1
+    return idx, dists
 
 
 class _ball_query(Function):
     """
-    Torch autograd Function wrapper for Ball Query C++/CUDA implementations.
+    Torch autograd Function wrapper for Ball Query (pure PyTorch implementation).
     """
 
     @staticmethod
     def forward(ctx, p1, p2, lengths1, lengths2, K, radius, skip_points_outside_cube):
         """
-        Arguments defintions the same as in the ball_query function
+        Arguments definitions the same as in the ball_query function
         """
-        idx, dists = _C.ball_query(
+        idx, dists = _ball_query_forward(
             p1, p2, lengths1, lengths2, K, radius, skip_points_outside_cube
         )
         ctx.save_for_backward(p1, p2, lengths1, lengths2, idx)
@@ -38,7 +77,6 @@ class _ball_query(Function):
     @once_differentiable
     def backward(ctx, grad_dists, grad_idx):
         p1, p2, lengths1, lengths2, idx = ctx.saved_tensors
-        # TODO(gkioxari) Change cast to floats once we add support for doubles.
         if not (grad_dists.dtype == torch.float32):
             grad_dists = grad_dists.float()
         if not (p1.dtype == torch.float32):
@@ -46,11 +84,9 @@ class _ball_query(Function):
         if not (p2.dtype == torch.float32):
             p2 = p2.float()
 
-        # Reuse the KNN backward function
-        # by default, norm is 2
-        grad_p1, grad_p2 = _C.knn_points_backward(
-            p1, p2, lengths1, lengths2, idx, 2, grad_dists
-        )
+        grad_p1, grad_p2 = _knn_points_backward_python(
+            p1, p2, idx, grad_dists, norm=2, lengths1=lengths1, lengths2=lengths2
+        )  # ball_query uses L2 squared distance
         return grad_p1, grad_p2, None, None, None, None, None
 
 

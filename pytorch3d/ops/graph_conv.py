@@ -9,9 +9,36 @@
 
 import torch
 import torch.nn as nn
-from pytorch3d import _C
 from torch.autograd import Function
 from torch.autograd.function import once_differentiable
+
+
+def _gather_scatter_impl(
+    input: torch.Tensor,
+    edges: torch.Tensor,
+    directed: bool,
+    backward: bool,
+) -> torch.Tensor:
+    """
+    Pure PyTorch implementation of gather_scatter.
+    For each edge (v0, v1): aggregates input[v1] into output[v0] (forward),
+    or input[v0] into output[v1] (backward). For undirected, both directions.
+    """
+    num_vertices, input_feature_dim = input.shape
+    num_edges = edges.shape[0]
+    output = torch.zeros_like(input)
+
+    if backward:
+        idx0, idx1 = edges[:, 1], edges[:, 0]
+    else:
+        idx0, idx1 = edges[:, 0], edges[:, 1]
+
+    idx0_exp = idx0.view(num_edges, 1).expand(num_edges, input_feature_dim)
+    idx1_exp = idx1.view(num_edges, 1).expand(num_edges, input_feature_dim)
+    output.scatter_add_(0, idx0_exp, input.gather(0, idx1_exp))
+    if not directed:
+        output.scatter_add_(0, idx1_exp, input.gather(0, idx0_exp))
+    return output
 
 
 class GraphConv(nn.Module):
@@ -73,12 +100,7 @@ class GraphConv(nn.Module):
         verts_w0 = self.w0(verts)  # (V, output_dim)
         verts_w1 = self.w1(verts)  # (V, output_dim)
 
-        if torch.cuda.is_available() and verts.is_cuda and edges.is_cuda:
-            neighbor_sums = gather_scatter(verts_w1, edges, self.directed)
-        else:
-            neighbor_sums = gather_scatter_python(
-                verts_w1, edges, self.directed
-            )  # (V, output_dim)
+        neighbor_sums = gather_scatter(verts_w1, edges, self.directed)
 
         # Add neighbor features to each vertex's features.
         out = verts_w0 + neighbor_sums
@@ -129,7 +151,7 @@ def gather_scatter_python(input, edges, directed: bool = False):
 
 class GatherScatter(Function):
     """
-    Torch autograd Function wrapper for gather_scatter C++/CUDA implementations.
+    Torch autograd Function wrapper for gather_scatter (pure PyTorch implementation).
     """
 
     @staticmethod
@@ -156,8 +178,7 @@ class GatherScatter(Function):
         ctx.directed = directed
         input, edges = input.contiguous(), edges.contiguous()
         ctx.save_for_backward(edges)
-        backward = False
-        output = _C.gather_scatter(input, edges, directed, backward)
+        output = _gather_scatter_impl(input, edges, directed, backward=False)
         return output
 
     @staticmethod
@@ -166,8 +187,9 @@ class GatherScatter(Function):
         grad_output = grad_output.contiguous()
         edges = ctx.saved_tensors[0]
         directed = ctx.directed
-        backward = True
-        grad_input = _C.gather_scatter(grad_output, edges, directed, backward)
+        grad_input = _gather_scatter_impl(
+            grad_output, edges, directed, backward=True
+        )
         grad_edges = None
         grad_directed = None
         return grad_input, grad_edges, grad_directed

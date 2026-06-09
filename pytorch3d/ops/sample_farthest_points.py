@@ -10,9 +10,58 @@ from random import randint
 from typing import List, Optional, Tuple, Union
 
 import torch
-from pytorch3d import _C
 
 from .utils import masked_gather
+
+
+def _sample_farthest_points_impl(
+    points: torch.Tensor,
+    lengths: torch.Tensor,
+    K: torch.Tensor,
+    start_idxs: torch.Tensor,
+    max_K: int,
+) -> torch.Tensor:
+    """
+    Pure PyTorch farthest point sampling.
+    Returns idx of shape (N, max_K) with selected indices, -1 for padding.
+    """
+    N, P, D = points.shape
+    device = points.device
+
+    if max_K < 0:
+        max_K = int(K.max().item())
+
+    sampled_indices = torch.full(
+        (N, max_K), -1, dtype=torch.int64, device=device
+    )
+
+    for n in range(N):
+        length_n = int(lengths[n].item())
+        k_n = min(length_n, int(K[n].item()))
+        last_idx = int(start_idxs[n].item())
+
+        sampled_indices[n, 0] = last_idx
+
+        # closest_dists[p] = min squared dist from p to any selected point
+        closest_dists = points.new_full(
+            (length_n,), float("inf"), dtype=torch.float32
+        )
+        selected_mask = torch.zeros(length_n, dtype=torch.bool, device=device)
+        selected_mask[last_idx] = True
+
+        for k in range(1, k_n):
+            # dist from each point to last selected
+            dist_to_last = (
+                (points[n, last_idx, :] - points[n, :length_n, :]) ** 2
+            ).sum(-1)
+            closest_dists = torch.minimum(closest_dists, dist_to_last)
+            closest_dists[selected_mask] = 0.0
+
+            last_idx = torch.argmax(closest_dists).item()
+            sampled_indices[n, k] = last_idx
+            selected_mask[last_idx] = True
+
+    return sampled_indices
 
 
 def sample_farthest_points(
@@ -96,8 +145,9 @@ def sample_farthest_points(
         start_idxs = torch.zeros_like(lengths)
 
     with torch.no_grad():
-        # pyre-fixme[16]: `pytorch3d_._C` has no attribute `sample_farthest_points`.
-        idx = _C.sample_farthest_points(points, lengths, K, start_idxs, max_K)
+        idx = _sample_farthest_points_impl(
+            points, lengths, K, start_idxs, max_K
+        )
     sampled_points = masked_gather(points, idx)
 
     return sampled_points, idx

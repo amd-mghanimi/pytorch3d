@@ -7,14 +7,33 @@
 # pyre-unsafe
 
 import torch
-from pytorch3d import _C
 from torch.autograd import Function
-from torch.autograd.function import once_differentiable
+
+
+_FACE_AREAS_NORMALS_EPS = 1e-6
+
+
+def _face_areas_normals_forward(verts: torch.Tensor, faces: torch.Tensor):
+    """
+    Pure PyTorch implementation of face areas and normals.
+    verts: (V, 3), faces: (F, 3) -> areas: (F,), normals: (F, 3)
+    """
+    v0 = verts[faces[:, 0]]  # (F, 3)
+    v1 = verts[faces[:, 1]]
+    v2 = verts[faces[:, 2]]
+    a = v1 - v0
+    b = v2 - v0
+    cross = torch.cross(a, b, dim=-1)
+    norm = cross.norm(dim=-1, keepdim=True).clamp(min=_FACE_AREAS_NORMALS_EPS)
+    areas = (norm.squeeze(-1) / 2.0).contiguous()
+    normals = (cross / norm).contiguous()
+    return areas, normals
 
 
 class _MeshFaceAreasNormals(Function):
     """
-    Torch autograd Function wrapper for face areas & normals C++/CUDA implementations.
+    Torch autograd Function wrapper for face areas & normals.
+    Uses pure PyTorch implementation (no C++/CUDA).
     """
 
     @staticmethod
@@ -45,23 +64,36 @@ class _MeshFaceAreasNormals(Function):
             verts = verts.float()
 
         ctx.save_for_backward(verts, faces)
-        areas, normals = _C.face_areas_normals_forward(verts, faces)
+        areas, normals = _face_areas_normals_forward(verts, faces)
         return areas, normals
 
     @staticmethod
-    @once_differentiable
     def backward(ctx, grad_areas, grad_normals):
-        grad_areas = grad_areas.contiguous()
-        grad_normals = grad_normals.contiguous()
         verts, faces = ctx.saved_tensors
-        # TODO(gkioxari) Change cast to floats once we add support for doubles.
-        if not (grad_areas.dtype == torch.float32):
-            grad_areas = grad_areas.float()
-        if not (grad_normals.dtype == torch.float32):
-            grad_normals = grad_normals.float()
-        grad_verts = _C.face_areas_normals_backward(
-            grad_areas, grad_normals, verts, faces
-        )
+        if grad_areas is None and grad_normals is None:
+            return None, None
+
+        # Grad is disabled inside Function.backward; use enable_grad to build graph
+        with torch.enable_grad():
+            verts_grad = verts.detach().requires_grad_(True)
+            areas, normals = _face_areas_normals_forward(verts_grad, faces)
+
+            grad_outputs = []
+            if grad_areas is not None:
+                grad_outputs.append(grad_areas.contiguous().float())
+            else:
+                grad_outputs.append(torch.zeros_like(areas))
+            if grad_normals is not None:
+                grad_outputs.append(grad_normals.contiguous().float())
+            else:
+                grad_outputs.append(torch.zeros_like(normals))
+
+            grad_verts, = torch.autograd.grad(
+                outputs=[areas, normals],
+                inputs=verts_grad,
+                grad_outputs=grad_outputs,
+                retain_graph=False,
+            )
         return grad_verts, None
 
 

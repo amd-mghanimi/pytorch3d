@@ -9,13 +9,231 @@
 from typing import Optional, Tuple, TYPE_CHECKING
 
 import torch
-from pytorch3d import _C
 from torch.autograd import Function
-from torch.autograd.function import once_differentiable
 
 
 if TYPE_CHECKING:
     from ..structures import Pointclouds, Volumes
+
+
+def _points_to_volumes_grid_coords(
+    points_3d: torch.Tensor,
+    grid_sizes: torch.Tensor,
+    align_corners: bool,
+    splat: bool,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """
+    Convert points_3d in [-1, 1] to grid coordinates.
+    Returns XYZ (int indices), and if splat: rXYZ (fractional parts for weights).
+    """
+    scale_offset = 1 if align_corners else 0
+    offset = 0.0 if align_corners else 0.5
+    grid_sizes_xyz = grid_sizes[:, [2, 1, 0]]  # (W, H, D) = (X, Y, Z)
+    points_3d_indices = (points_3d + 1) * 0.5 * (
+        grid_sizes_xyz[:, None].type_as(points_3d) - scale_offset
+    ) - offset
+    if splat:
+        XYZ = points_3d_indices.floor().long()
+        rXYZ = points_3d_indices - XYZ.type_as(points_3d)
+        return XYZ, rXYZ, grid_sizes_xyz
+    else:
+        XYZ = torch.round(points_3d_indices).long()
+        return XYZ, None, grid_sizes_xyz
+
+
+def _points_to_volumes_forward(
+    points_3d: torch.Tensor,
+    points_features: torch.Tensor,
+    volume_densities: torch.Tensor,
+    volume_features: torch.Tensor,
+    grid_sizes: torch.Tensor,
+    mask: torch.Tensor,
+    point_weight: float,
+    align_corners: bool,
+    splat: bool,
+) -> None:
+    """Pure PyTorch forward: add point weights and features to volumes in place."""
+    N, P, C = points_features.shape
+    v_shape = volume_densities.shape[2:]
+    n_voxels = int(torch.prod(torch.tensor(v_shape)).item())
+    vol_dens_flat = volume_densities.view(N, n_voxels, 1)
+    vol_feat_flat = volume_features.view(N, C, n_voxels)
+    points_feat_flat = points_features.permute(0, 2, 1)  # (N, C, P)
+
+    result = _points_to_volumes_grid_coords(
+        points_3d, grid_sizes, align_corners, splat
+    )
+    XYZ, rXYZ, grid_sizes_xyz = result[0], result[1], result[2]
+
+    X, Y, Z = XYZ.split(1, dim=2)
+    rand_idx = X.new_zeros(X.shape).random_(0, n_voxels)
+
+    if splat:
+        rX, rY, rZ = rXYZ.split(1, dim=2)
+        for xdiff in (0, 1):
+            X_ = X + xdiff
+            wX = (1 - xdiff) + (2 * xdiff - 1) * rX
+            for ydiff in (0, 1):
+                Y_ = Y + ydiff
+                wY = (1 - ydiff) + (2 * ydiff - 1) * rY
+                for zdiff in (0, 1):
+                    Z_ = Z + zdiff
+                    wZ = (1 - zdiff) + (2 * zdiff - 1) * rZ
+                    w = wX * wY * wZ * point_weight
+                    valid = (
+                        (X_ >= 0)
+                        * (X_ < grid_sizes_xyz[:, None, 0:1])
+                        * (Y_ >= 0)
+                        * (Y_ < grid_sizes_xyz[:, None, 1:2])
+                        * (Z_ >= 0)
+                        * (Z_ < grid_sizes_xyz[:, None, 2:3])
+                    ).long()
+                    idx = (
+                        (Z_ * grid_sizes[:, None, 1:2] + Y_)
+                        * grid_sizes[:, None, 2:3]
+                        + X_
+                    )
+                    idx_valid = idx * valid + rand_idx * (1 - valid)
+                    w_valid = w * valid.type_as(w) * mask[:, :, None]
+                    vol_dens_flat.scatter_add_(1, idx_valid, w_valid)
+                    idx_exp = idx_valid.view(N, 1, P).expand_as(points_feat_flat)
+                    w_exp = w_valid.view(N, 1, P)
+                    vol_feat_flat.scatter_add_(
+                        2, idx_exp, w_exp * points_feat_flat
+                    )
+    else:
+        valid = (
+            (X >= 0)
+            * (X < grid_sizes_xyz[:, None, 0:1])
+            * (Y >= 0)
+            * (Y < grid_sizes_xyz[:, None, 1:2])
+            * (Z >= 0)
+            * (Z < grid_sizes_xyz[:, None, 2:3])
+        ).long()
+        idx = (Z * grid_sizes[:, None, 1:2] + Y) * grid_sizes[:, None, 2:3] + X
+        idx_valid = idx * valid + rand_idx * (1 - valid)
+        w_valid = (
+            valid.type_as(vol_dens_flat) * mask[:, :, None] * point_weight
+        )
+        vol_dens_flat.scatter_add_(1, idx_valid, w_valid)
+        idx_exp = idx_valid.view(N, 1, P).expand_as(points_feat_flat)
+        w_exp = w_valid.view(N, 1, P)
+        vol_feat_flat.scatter_add_(2, idx_exp, w_exp * points_feat_flat)
+
+
+def _points_to_volumes_backward(
+    points_3d: torch.Tensor,
+    points_features: torch.Tensor,
+    grid_sizes: torch.Tensor,
+    mask: torch.Tensor,
+    point_weight: float,
+    align_corners: bool,
+    splat: bool,
+    grad_volume_densities: torch.Tensor,
+    grad_volume_features: torch.Tensor,
+    grad_points_3d: torch.Tensor,
+    grad_points_features: torch.Tensor,
+) -> None:
+    """Pure PyTorch backward: scatter grad from volumes back to points."""
+    N, P, C = points_features.shape
+    v_shape = grad_volume_densities.shape[2:]
+    n_voxels = int(torch.prod(torch.tensor(v_shape)).item())
+    grad_dens_flat = grad_volume_densities.view(N, n_voxels, 1)
+    grad_feat_flat = grad_volume_features.view(N, C, n_voxels)
+
+    result = _points_to_volumes_grid_coords(
+        points_3d, grid_sizes, align_corners, splat
+    )
+    XYZ, rXYZ, grid_sizes_xyz = result[0], result[1], result[2]
+    X, Y, Z = XYZ.split(1, dim=2)
+
+    scale_offset = 1 if align_corners else 0
+
+    if splat:
+        rX, rY, rZ = rXYZ.split(1, dim=2)
+        for xdiff in (0, 1):
+            X_ = X + xdiff
+            wX = (1 - xdiff) + (2 * xdiff - 1) * rX
+            for ydiff in (0, 1):
+                Y_ = Y + ydiff
+                wY = (1 - ydiff) + (2 * ydiff - 1) * rY
+                for zdiff in (0, 1):
+                    Z_ = Z + zdiff
+                    wZ = (1 - zdiff) + (2 * zdiff - 1) * rZ
+                    w = wX * wY * wZ * point_weight
+                    valid = (
+                        (X_ >= 0)
+                        * (X_ < grid_sizes_xyz[:, None, 0:1])
+                        * (Y_ >= 0)
+                        * (Y_ < grid_sizes_xyz[:, None, 1:2])
+                        * (Z_ >= 0)
+                        * (Z_ < grid_sizes_xyz[:, None, 2:3])
+                    ).long()
+                    idx = (
+                        (Z_ * grid_sizes[:, None, 1:2] + Y_)
+                        * grid_sizes[:, None, 2:3]
+                        + X_
+                    )
+                    # Gather: grad_points_features += grad_volume_features[idx] * w
+                    grad_feat_at = grad_feat_flat.gather(
+                        2, idx.view(N, 1, P).expand(N, C, P)
+                    )
+                    w_valid = (
+                        w * valid.type_as(w) * mask[:, :, None]
+                    )  # (N, P, 1)
+                    # grad_feat_at (N, C, P) -> permute to (N, P, C) for add
+                    grad_points_features.add_(
+                        grad_feat_at.permute(0, 2, 1) * w_valid
+                    )
+                    # grad_points_3d: chain rule through weight derivatives
+                    grad_dens_at = grad_dens_flat.gather(1, idx)
+                    source_grad = grad_dens_at + (
+                        points_features.permute(0, 2, 1) * grad_feat_at
+                    ).sum(1, keepdim=True).permute(0, 2, 1)
+                    coeff = (
+                        0.5
+                        * point_weight
+                        * (grid_sizes_xyz - scale_offset).type_as(points_3d)
+                    )  # (N, 3)
+                    vmask = valid.type_as(source_grad) * mask[:, :, None]
+                    grad_points_3d[:, :, 0] += (
+                        source_grad.squeeze(-1)
+                        * ((2 * xdiff - 1) * wY * wZ).squeeze(-1)
+                        * coeff[:, 0:1]
+                        * vmask.squeeze(-1)
+                    )
+                    grad_points_3d[:, :, 1] += (
+                        source_grad.squeeze(-1)
+                        * ((2 * ydiff - 1) * wX * wZ).squeeze(-1)
+                        * coeff[:, 1:2]
+                        * vmask.squeeze(-1)
+                    )
+                    grad_points_3d[:, :, 2] += (
+                        source_grad.squeeze(-1)
+                        * ((2 * zdiff - 1) * wX * wY).squeeze(-1)
+                        * coeff[:, 2:3]
+                        * vmask.squeeze(-1)
+                    )
+    else:
+        valid = (
+            (X >= 0)
+            * (X < grid_sizes_xyz[:, None, 0:1])
+            * (Y >= 0)
+            * (Y < grid_sizes_xyz[:, None, 1:2])
+            * (Z >= 0)
+            * (Z < grid_sizes_xyz[:, None, 2:3])
+        ).long()
+        rand_idx = X.new_zeros(X.shape).random_(0, n_voxels)
+        idx = (Z * grid_sizes[:, None, 1:2] + Y) * grid_sizes[:, None, 2:3] + X
+        idx_valid = idx * valid + rand_idx * (1 - valid)
+        idx_exp = idx_valid.view(N, 1, P).expand(N, C, P)
+        grad_feat_at = grad_feat_flat.gather(2, idx_exp)  # (N, C, P)
+        w_valid = (
+            point_weight * valid.type_as(grad_feat_at) * mask[:, :, None]
+        )  # (N, P, 1)
+        grad_points_features.add_(
+            grad_feat_at.permute(0, 2, 1) * w_valid
+        )
 
 
 class _points_to_volumes_function(Function):
@@ -118,8 +336,7 @@ class _points_to_volumes_function(Function):
         if N5 != N or P2 != P:
             raise ValueError("Bad mask shape")
 
-        # pyre-fixme[16]: Module `pytorch3d` has no attribute `_C`.
-        _C.points_to_volumes_forward(
+        _points_to_volumes_forward(
             points_3d,
             points_features,
             volume_densities,
@@ -140,7 +357,6 @@ class _points_to_volumes_function(Function):
         return volume_densities, volume_features
 
     @staticmethod
-    @once_differentiable
     def backward(ctx, grad_volume_densities, grad_volume_features):
         splat = ctx.splat
         N, C = grad_volume_features.shape[:2]
@@ -152,12 +368,10 @@ class _points_to_volumes_function(Function):
             points_3d, grid_sizes, mask = ctx.saved_tensors
             P = points_3d.shape[1]
             ones = points_3d.new_zeros(1, 1, 1)
-            # There is no gradient. Just need something to let its accessors exist.
             grad_points_3d = ones.expand_as(points_3d)
-            # points_features not needed. Just need something to let its accessors exist.
             points_features = ones.expand(N, P, C)
         grad_points_features = points_3d.new_zeros(N, P, C)
-        _C.points_to_volumes_backward(
+        _points_to_volumes_backward(
             points_3d,
             points_features,
             grid_sizes,

@@ -4,9 +4,11 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import collections
-import os
 import pickle
 import warnings
 
@@ -18,6 +20,7 @@ from nerf.nerf_renderer import RadianceFieldRenderer, visualize_nerf_outputs
 from nerf.stats import Stats
 from omegaconf import DictConfig
 from visdom import Visdom
+
 
 
 CONFIG_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "configs")
@@ -111,7 +114,7 @@ def main(cfg: DictConfig):
 
     # The learning rate scheduling is implemented with LambdaLR PyTorch scheduler.
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lr_lambda, last_epoch=start_epoch - 1, verbose=False
+        optimizer, lr_lambda, last_epoch=start_epoch - 1
     )
 
     # Initialize the cache for storing variables needed for visualization.

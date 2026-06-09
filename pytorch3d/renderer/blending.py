@@ -9,8 +9,42 @@
 from typing import NamedTuple, Sequence, Union
 
 import torch
-from pytorch3d import _C
 from pytorch3d.common.datatypes import Device
+
+
+def _sigmoid_alpha_blend_forward(
+    dists: torch.Tensor, pix_to_face: torch.Tensor, sigma: float
+) -> torch.Tensor:
+    """
+    Pure PyTorch implementation of sigmoid alpha blend forward.
+    Blends the top K faces per pixel based on 2D euclidean distance.
+    """
+    mask = pix_to_face >= 0
+    # Distance is negated: negative dist = inside face, positive = outside
+    prob = torch.sigmoid(-dists / sigma) * mask.float()
+    # Cumulative product: alpha=0 if any face fully covers the pixel
+    alpha = torch.prod(1.0 - prob, dim=-1)
+    return 1.0 - alpha
+
+
+def _sigmoid_alpha_blend_backward(
+    grad_alphas: torch.Tensor,
+    alphas: torch.Tensor,
+    dists: torch.Tensor,
+    pix_to_face: torch.Tensor,
+    sigma: float,
+) -> torch.Tensor:
+    """
+    Pure PyTorch implementation of sigmoid alpha blend backward.
+    """
+    mask = pix_to_face >= 0
+    prob = torch.sigmoid(-dists / sigma) * mask.float()
+    # alpha = prod(1-p) from forward; 1 - alphas = prod(1-p)
+    alpha = 1.0 - alphas
+    grad_dists = (
+        grad_alphas.unsqueeze(-1) * (-1.0 / sigma) * prob * alpha.unsqueeze(-1)
+    )
+    return grad_dists * mask.float()
 
 # Example functions for blending the top K colors per pixel using the outputs
 # from rasterization.
@@ -91,11 +125,11 @@ def hard_rgb_blend(
     return torch.cat([pixel_colors, alpha], dim=-1)  # (N, H, W, 4)
 
 
-# Wrapper for the C++/CUDA Implementation of sigmoid alpha blend.
+# PyTorch implementation of sigmoid alpha blend (no C++/CUDA extension required).
 class _SigmoidAlphaBlend(torch.autograd.Function):
     @staticmethod
     def forward(ctx, dists, pix_to_face, sigma):
-        alphas = _C.sigmoid_alpha_blend(dists, pix_to_face, sigma)
+        alphas = _sigmoid_alpha_blend_forward(dists, pix_to_face, sigma)
         ctx.save_for_backward(dists, pix_to_face, alphas)
         ctx.sigma = sigma
         return alphas
@@ -104,7 +138,7 @@ class _SigmoidAlphaBlend(torch.autograd.Function):
     def backward(ctx, grad_alphas):
         dists, pix_to_face, alphas = ctx.saved_tensors
         sigma = ctx.sigma
-        grad_dists = _C.sigmoid_alpha_blend_backward(
+        grad_dists = _sigmoid_alpha_blend_backward(
             grad_alphas, alphas, dists, pix_to_face, sigma
         )
         return grad_dists, None, None
